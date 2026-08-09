@@ -7,6 +7,8 @@
 #include <userd.h>
 #include <baselib.h>
 #include <log.h>
+#include <predata.h>
+#include <sucompat.h>
 
 int report_user_event(const char *event, const char *args)
 {
@@ -17,6 +19,7 @@ int report_user_event(const char *event, const char *args)
     if (lib_strcmp(safe_event, "post-fs-data") == 0) {
         log_boot("post-fs-data: loading ap package config ...\n");
         load_ap_package_config();
+        sucompat_init();
     }
     if (lib_strcmp(safe_event, "boot-completed") == 0) {
 
@@ -27,5 +30,6 @@ int report_user_event(const char *event, const char *args)
     }
     #endif
     logki("user report event: %s, args: %s\n", safe_event, safe_args);
+    extra_event_init_args(safe_event, safe_args);
     return 0;
 }
