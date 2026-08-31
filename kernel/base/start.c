@@ -511,12 +511,17 @@ static void prot_myself()
     }
 }
 
-// The map area lives inside a sacrificed kernel function (the map anchor).
-// _paging_init executes from that very region and only returns to the kernel
-// after start() completes, so this must NOT run while it is still executing;
-// it is deferred to the rest_init hook (see patch.c before_rest_init).
+// Restore the map anchor area (a sacrificed kernel function) to its
+// original bytes. Idempotent. Always runs inside start(), before
+// sched_init: the anchor functions (tcp_init_sock & friends) must be
+// restored before any of them can be called again, and the tail return
+// below in start() never executes the anchor bytes after this.
+static int map_restored = 0;
 void restore_map()
 {
+    if (map_restored) return;
+    map_restored = 1;
+
     uint64_t start = kernel_va + start_preset.map_offset;
     uint64_t end = start + start_preset.map_backup_len;
     log_boot("Restore: %llx, %llx\n", start, end);
@@ -712,11 +717,43 @@ int __attribute__((section(".start.text"))) __noinline start(uint64_t kimage_vof
     rc = start_init(kimage_voff, linear_voff);
     if (rc) return rc;
     prot_myself();
-    // restore_map() is deferred to the rest_init hook: the map area that
-    // _paging_init is executing from must stay intact until it has returned
+    // restore the map anchor (the sacrificed tcp_init_sock & friends) as
+    // soon as KP's regions are up; the tail return below never executes
+    // the anchor bytes again, so this is safe for every kernel
+    restore_map();
     log_regs();
     predata_init();
     symbol_init();
     rc = patch();
-    return rc;
+    // Return to the kernel's paging_init caller directly, restoring
+    // _paging_init's callee-saved registers from its frame: [our x29] = its
+    // x29 (P); its saved x19-x28 at P+16..P+88; the caller's frame pointer
+    // at [P]; the kernel's return address at P+8; the caller's sp at
+    // P+0x280 (frame 0x290 with x29 = sp + 0x10 — the same layout on the
+    // scratch and legacy _paging_init paths, since it is the same compiled
+    // function entered via blr in both cases).  x29 must be restored from
+    // [P], exactly like _paging_init's own epilogue (ldp x29, x30,
+    // [sp, #16]) — returning with x29 = P instead of the caller's FP hangs
+    // the 4.9 device kernel in setup_arch's post-paging_init code.  This
+    // bypasses _paging_init's epilogue, which lives in the RESTORED map
+    // anchor: with the map section (~0xf10, scratch machinery included)
+    // larger than the carved hole, the epilogue position can land
+    // mid-function inside e.g. do_tcp_getsockopt, and executing those
+    // restored native bytes kills 5.10 GKI before the console is up
+    // (verified in QEMU).  The historical 4.9 tail-return boot loop was
+    // confounded with the scratch path running on 4.x.
+    __asm__ volatile(
+        "ldr x10, [x29]\n"
+        "ldp x19, x20, [x10, #16]\n"
+        "ldp x21, x22, [x10, #32]\n"
+        "ldp x23, x24, [x10, #48]\n"
+        "ldp x25, x26, [x10, #64]\n"
+        "ldp x27, x28, [x10, #80]\n"
+        "ldr x29, [x10]\n"
+        "ldr x30, [x10, #8]\n"
+        "add sp, x10, #0x280\n"
+        "ret\n"
+        : : : "x10", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
+              "x27", "x28", "x29", "x30", "memory");
+    __builtin_unreachable();
 }
