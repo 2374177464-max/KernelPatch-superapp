@@ -45,11 +45,9 @@
 #include <uapi/asm-generic/errno.h>
 #include <security/selinux/include/security.h>
 #include <security/selinux/include/avc.h>
+#include <selinux_hide.h>
 
 /* ---- constants ---- */
-
-#define KP_SEPOLICY_MIN_VERSION VERSION(4, 19, 0)
-#define KP_SEPOLICY_WITH_POLICY_MIN_VERSION VERSION(6, 4, 0) /* helpers drop the state arg here */
 
 #define KP_POLICY_POLICYDB_OFFSET (sizeof(void *)) /* struct selinux_policy { sidtab*, policydb, ... } */
 /* Heap allocations for the copy (KernelSU uses kmemdup/vmalloc the same way).
@@ -450,7 +448,7 @@ static void *g_backup_policy; /* our own struct selinux_policy-equivalent (heap)
 
 static bool selinux_sepolicy_supported(void)
 {
-    return kver >= KP_SEPOLICY_MIN_VERSION;
+    return selinux_hide_is_supported();
 }
 
 static struct policydb *kp_backup_policydb(void);
@@ -461,12 +459,7 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
 static int kp_sid_to_context_with_policy(u32 sid, char **scontext, u32 *scontext_len);
 static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);
 
-/* ---- clean-eval scope (selinux_magisk_access_filter KPM mechanism) ----
- * While an app's /sys/fs/selinux/context or /access query is being answered
- * under this scope, context_struct_compute_av()/string_to_context_struct() get
- * their policydb argument redirected to the clean copy, so the kernel's own
- * lookup computes against the pre-root policy.  Task-keyed and synchronous: only
- * the task that entered the scope is redirected. */
+
 static struct {
     void *task;
     u32 depth;
@@ -515,10 +508,6 @@ void selinux_sepolicy_clean_eval_leave(void)
     kp_clean_eval_leave();
 }
 
-/* context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, xperms):
- * the policydb argument is redirected to the clean copy while an app query is
- * being answered, so the kernel's own AV computation runs against the pre-root
- * policy. */
 static void before_context_struct_compute_av(hook_fargs6_t *a, void *u)
 {
     if (!kp_clean_eval_active() || !g_backup_ready) return;
@@ -712,7 +701,7 @@ static void kp_install_load_hook(void)
     if (g_load_hook_installed || !selinux_sepolicy_supported()) return;
     addr = lookup_name_with_suffix("security_load_policy");
     if (!addr) return;
-    if (kver >= KP_SEPOLICY_WITH_POLICY_MIN_VERSION)
+    if (selinux_hide_is_without_sepolicy_state_version())
         hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
     else
         hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
@@ -859,22 +848,30 @@ static int kp_context_to_sid_with_policy(const char *scontext, u32 scontext_len,
     struct policydb *policydb = kp_backup_policydb();
     void *sidtab = kp_backup_sidtab();
     struct context context;
-    char *scontext2;
     int rc;
 
     if (!policydb || !sidtab || !scontext_len) return -EINVAL;
     if (!kp_string_to_context_struct || !kp_sidtab_context_to_sid) return -ENOSYS;
 
-    scontext2 = kp_vmalloc(scontext_len + 1);
-    if (!scontext2) return -ENOMEM;
+    /* Hot path: every app selinuxfs query goes through here.  Use a stack
+     * buffer for the (short) context string; vmalloc/vfree per query was a
+     * measurable cost and a page-table churn source. */
+    char stackbuf[256];
+    char *heapbuf = NULL, *scontext2;
+    if (scontext_len < sizeof(stackbuf)) {
+        scontext2 = stackbuf;
+    } else {
+        heapbuf = kp_vmalloc(scontext_len + 1);
+        if (!heapbuf) return -ENOMEM;
+        scontext2 = heapbuf;
+    }
     lib_memcpy(scontext2, scontext, scontext_len);
     scontext2[scontext_len] = '\0';
 
     rc = kp_string_to_context_struct(policydb, sidtab, scontext2, &context, def_sid);
-    if (rc) goto out;
-    rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
-out:
-    kp_vfree(scontext2);
+    if (!rc)
+        rc = kp_sidtab_context_to_sid(sidtab, &context, out_sid);
+    if (heapbuf) kp_vfree(heapbuf);
     return rc;
 }
 
@@ -925,7 +922,16 @@ static void kp_compute_av_user_with_policy(u32 ssid, u32 tsid, u16 tclass, struc
     te = kp_sidtab_search_core(sidtab, tsid, 0);
     if (!te) return;
     tcontext = &te->context;
-    if (unlikely(!tclass)) return;
+
+    if (unlikely(!tclass)) {
+        /* KernelSU security_compute_av_user_with_policy parity: stock answers
+         * an unknown class with everything granted when the (clean) policy
+         * allows unknown classes.  The permissive-domain flag is deliberately
+         * not replicated: reading permissive_map needs an ebitmap walk over
+         * layout-sensitive nodes for no hiding benefit. */
+        if (policydb->allow_unknown) avd->allowed = 0xffffffff;
+        return;
+    }
 
     kp_context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, NULL);
 }
@@ -994,18 +1000,19 @@ int selinux_sepolicy_init(void)
     kp_context_struct_to_string = (context_struct_to_string_fn)lookup_name_with_suffix("context_struct_to_string");
     kp_sidtab_search_core = (sidtab_search_core_fn)lookup_name_with_suffix("sidtab_search_core");
     kp_context_struct_compute_av = (context_struct_compute_av_fn)lookup_name_with_suffix("context_struct_compute_av");
-
-    /* Only the argument-redirect hooks are needed: the deep copy is consumed by
-     * swapping the policydb argument while an app query runs. */
-    addr = lookup_name_with_suffix("context_struct_compute_av");
-    if (addr) {
-        hook_wrap6((void *)addr, before_context_struct_compute_av, NULL, NULL);
-        log_boot("selinux_sepolicy: hooked context_struct_compute_av @ %llx\n", addr);
-    }
-    addr = lookup_name_with_suffix("string_to_context_struct");
-    if (addr) {
-        hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
-        log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
+    if (!selinux_hide_is_new_version()) {
+        /* Only the argument-redirect hooks are needed: the deep copy is consumed by
+        * swapping the policydb argument while an app query runs. */
+        addr = lookup_name_with_suffix("context_struct_compute_av");
+        if (addr) {
+            hook_wrap6((void *)addr, before_context_struct_compute_av, NULL, NULL);
+            log_boot("selinux_sepolicy: hooked context_struct_compute_av @ %llx\n", addr);
+        }
+        addr = lookup_name_with_suffix("string_to_context_struct");
+        if (addr) {
+            hook_wrap5((void *)addr, before_string_to_context_struct, NULL, NULL);
+            log_boot("selinux_sepolicy: hooked string_to_context_struct @ %llx\n", addr);
+        }
     }
 
     /* Capture policy blobs as they are loaded, so the clean copy comes from the
@@ -1014,7 +1021,7 @@ int selinux_sepolicy_init(void)
      * (state, data, len, load_state). */
     addr = lookup_name_with_suffix("security_load_policy");
     if (addr) {
-        if (kver >= KP_SEPOLICY_WITH_POLICY_MIN_VERSION)
+        if (selinux_hide_is_without_sepolicy_state_version())
             hook_wrap3((void *)addr, NULL, after_security_load_policy_3, NULL);
         else
             hook_wrap4((void *)addr, NULL, after_security_load_policy_4, NULL);
